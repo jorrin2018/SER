@@ -34,7 +34,7 @@ class SERDataset(Dataset):
         self.max_len = max_len
         self.audio_dir = audio_dir
         self.file_list = metadata['path'].tolist()
-        self.labels = metadata['label'].tolist()
+        self.labels = metadata['emotion'].tolist()
         self.label2idx = {lab: idx for idx, lab in enumerate(sorted(set(self.labels)))}
         # Cargador preentrenado de x-vectors (speaker embeddings)
         self.spk_enc = EncoderClassifier.from_hparams(
@@ -133,12 +133,12 @@ def eval_epoch(model, loader, criterion, device):
 
 def main():
     # Configuraciones y paths
-    metadata_csv = "data/metadata.csv"
-    audio_dir = "data/audio"
+    metadata_csv = "F:/DOCTORADO/DATASETS/IEMOCAP/archive/iemocap_full_dataset.csv"
+    audio_dir = "F:/DOCTORADO/DATASETS/IEMOCAP/archive/IEMOCAP_full_release"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Leer metadata y split 75/25
     df = pd.read_csv(metadata_csv)
-    train_df, val_df = train_test_split(df, test_size=0.25, stratify=df['label'], random_state=42)
+    train_df, val_df = train_test_split(df, test_size=0.25, stratify=df['emotion'], random_state=42)
     # Datasets y DataLoaders
     train_ds = SERDataset(train_df, audio_dir)
     val_ds = SERDataset(val_df, audio_dir)
