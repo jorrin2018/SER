@@ -6,340 +6,357 @@ Created on Thu May 22 16:58:29 2025
 """
 """
 Speech Emotion Recognition (SER) pipeline with modular features,
-configurable attention (single vs. multi-head, self vs. temporal),
-class balancing, and optional cross-validation.
+configurable attention, class balancing, and optional cross-validation.
+Using CrossEntropyLoss and integer labels for multiclass classification.
 """
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import librosa
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split, KFold
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 from speechbrain.pretrained import EncoderClassifier
 
 # ======================
 # Configuration flags
 # ======================
-ENABLE_SPECTRAL = True
-ENABLE_SPECTRAL_ATTENTION = True
-ENABLE_PROSODY = True
-ENABLE_PROSODY_ATTENTION = True
-ENABLE_XVECTOR = False
-ENABLE_SELF_ATTENTION = False       # Self-attention before LSTM
-ENABLE_MULTIHEAD_ATTENTION = True  # Multi-head attention after LSTM
-ENABLE_TEMPORAL_ATTENTION = True    # Single-head temporal attention
-ENABLE_CLASS_BALANCING = True      # Weighted sampling for classes
-ENABLE_CROSS_VALIDATION = True     # K-fold cross-validation
+ENABLE_SPECTRAL = False
+ENABLE_SPECTRAL_ATTENTION = False
+ENABLE_MELSPECTROGRAM = False
+ENABLE_PROSODY = False
+ENABLE_PROSODY_ATTENTION = False
+ENABLE_XVECTOR = True
+ENABLE_SELF_ATTENTION = False        # Self-attention before LSTM
+ENABLE_MULTIHEAD_ATTENTION = True   # Multi-head attention after LSTM
+ENABLE_TEMPORAL_ATTENTION = False   # Single-head temporal attention
+ENABLE_CLASS_BALANCING = False
+ENABLE_CROSS_VALIDATION = False
+
+# ======================
+# Feature dims
+# ======================
+N_MFCC = 40           # same as n_mfcc in SERDataset
+N_MELS = 64           # mel-spectrogram dimension
+PROSODIC_FEAT_DIM = 5 # [rms, pitch, zcr, spec_cent, spec_bw]
+
+
+# ======================
+# Fixed label list (without 'xxx')
+# ======================
+LABEL_LIST = ['neu', 'fru', 'sur', 'ang', 'hap', 'sad', 'exc', 'fea', 'dis']
+LABEL2IDX = {lab: i for i, lab in enumerate(LABEL_LIST)}
+
 
 class SERDataset(Dataset):
     """
-    Speech Emotion Recognition dataset with modular feature extraction.
+    Speech Emotion Recognition Dataset that loads:
+    - metadata CSV with columns ['path','emotion']
+    - audio files under audio_dir
+
+    Extracts spectral, prosodic, and/or x-vector features per flags.
     """
-    def __init__(self, metadata, audio_dir, label2idx,
+    def __init__(self, metadata: pd.DataFrame, audio_dir: str,
                  sample_rate=16000, n_mfcc=40, max_len=200):
+        self.audio_dir = audio_dir
         self.sample_rate = sample_rate
         self.n_mfcc = n_mfcc
         self.max_len = max_len
-        self.audio_dir = audio_dir
-        self.label2idx = label2idx
-        self.num_classes = len(label2idx)
-        self.file_list = metadata['path'].tolist()
-        self.labels = metadata['emotion'].tolist()
-        if ENABLE_XVECTOR:
-            self.spk_enc = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"},
-                savedir="pretrained_models/spkrec-ecapa-voxceleb"
-            )
+        self.metadata = metadata.reset_index(drop=True)
+        self.spk_enc = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cpu"},
+            savedir="pretrained_models/spkrec-ecapa-voxceleb"
+        )
 
     def __len__(self):
-        return len(self.file_list)
+        return len(self.metadata)
 
     def __getitem__(self, idx):
-        # Load waveform
-        path = os.path.join(self.audio_dir, self.file_list[idx])
-        wav, _ = librosa.load(path, sr=self.sample_rate)
+        row = self.metadata.iloc[idx]
+        emotion = row['emotion']
+        label = torch.tensor(LABEL2IDX[emotion], dtype=torch.long)
+
+        wav_path = os.path.join(self.audio_dir, row['path'])
+        wav, sr = librosa.load(wav_path, sr=self.sample_rate)
+
         feats = []
-        # Spectral features (MFCC)
+        # Spectral features
         if ENABLE_SPECTRAL:
-            spec = librosa.feature.mfcc(y=wav, sr=self.sample_rate, n_mfcc=self.n_mfcc).T
+            mfcc = librosa.feature.mfcc(y=wav, sr=sr, n_mfcc=self.n_mfcc).T  # [T, n_mfcc]
             if ENABLE_SPECTRAL_ATTENTION:
-                att = F.softmax(torch.tensor(spec), dim=-1)
-                spec = spec * att.numpy()
-            feats.append(spec)
+                attn_w = torch.softmax(
+                    nn.Linear(self.n_mfcc, 1)(torch.tensor(mfcc, dtype=torch.float)),
+                    dim=0
+                ).detach().cpu().numpy()
+                mfcc = mfcc * attn_w
+            feats.append(mfcc)
+            
+        # 2) Mel-spectrograma (nuevo)
+        if ENABLE_MELSPECTROGRAM:
+            melspec = librosa.feature.melspectrogram(
+                y=wav, sr=sr, n_mels=64, fmax=sr//2
+            ).T                                # [T, 64]
+            melspec_db = librosa.power_to_db(melspec)
+            feats.append(melspec_db)
+            
         # Prosodic features
         if ENABLE_PROSODY:
-            rms = librosa.feature.rms(y=wav).T
-            pitches, _ = librosa.piptrack(y=wav, sr=self.sample_rate)
-            pitch = np.mean(pitches, axis=0)[None, :].T
-            pro = np.concatenate([rms, pitch], axis=1)
+            # energía RMS y pitch
+            rms = librosa.feature.rms(y=wav).T                # [T,1]
+            pitches, _ = librosa.piptrack(y=wav, sr=sr)
+            pitch = np.mean(pitches, axis=0)[None, :].T       # [T,1]
+            # nuevas: ZCR, centroid y bandwidth
+            zcr = librosa.feature.zero_crossing_rate(y=wav).T             # [T,1]
+            spec_cent = librosa.feature.spectral_centroid(y=wav, sr=sr).T # [T,1]
+            spec_bw   = librosa.feature.spectral_bandwidth(y=wav, sr=sr).T# [T,1]
+
+            pros = np.concatenate([rms, pitch, zcr, spec_cent, spec_bw], axis=1)  # [T,5]
             if ENABLE_PROSODY_ATTENTION:
-                att = F.softmax(torch.tensor(pro), dim=-1)
-                pro = pro * att.numpy()
-            feats.append(pro)
-        # Combine features
-        feat = np.concatenate(feats, axis=1)
-        T, D = feat.shape
-        if T < self.max_len:
-            pad = np.zeros((self.max_len - T, D))
-            feat = np.vstack([feat, pad])
+                attn_w = torch.softmax(
+                    nn.Linear(pros.shape[1], 1)(torch.tensor(pros, dtype=torch.float)),
+                    dim=0
+                ).detach().numpy()
+                pros = pros * attn_w
+            feats.append(pros)
+
+        # Concatenate and pad/truncate
+        if feats:
+            feat = np.concatenate(feats, axis=1)  # [T, total_dim]
+            if feat.shape[0] < self.max_len:
+                pad = np.zeros((self.max_len - feat.shape[0], feat.shape[1]))
+                feat = np.vstack([feat, pad])
+            else:
+                feat = feat[:self.max_len]
+            acoustic = torch.tensor(feat, dtype=torch.float)
         else:
-            feat = feat[:self.max_len]
-        acoustic = torch.tensor(feat, dtype=torch.float)
+            acoustic = torch.zeros(0, 0, dtype=torch.float)
+
         # x-vector
         if ENABLE_XVECTOR:
-            w = torch.tensor(wav, dtype=torch.float).unsqueeze(0)
-            emb = self.spk_enc.encode_batch(w).squeeze(0)
-            if emb.dim() > 1:
-                emb = emb.mean(-1)
-            xvec = emb
+            wav_tensor = torch.tensor(wav, dtype=torch.float).unsqueeze(0)
+            emb = self.spk_enc.encode_batch(wav_tensor)  # [1, xdim] or [1, xdim, 1]
+            xvec = emb.squeeze(0)
+            if xvec.dim() > 1:
+                xvec = xvec.mean(dim=-1)
         else:
-            xvec = torch.zeros(0)
-        # Label one-hot
-        idx_label = self.label2idx[self.labels[idx]]
-        label = F.one_hot(torch.tensor(idx_label), num_classes=self.num_classes).float()
+            xvec = torch.zeros(0, dtype=torch.float)
+
         return acoustic, xvec, label
 
-class LSTMAttentionSER(nn.Module):
+
+class LSTMAttentionWithXVector(nn.Module):
     """
-    BiLSTM-based SER model with optional self-attention before LSTM,
-    and multi-head or single-head temporal attention after LSTM,
-    plus optional x-vector integration.
+    SER model with optional self-attention, BiLSTM, multi-head or temporal attention,
+    and x-vector concatenation.
     """
-    def __init__(self, input_dim, xvec_dim, hidden_dim, num_classes):
+    def __init__(self, acoustic_dim, xvec_dim, hidden_dim, num_classes):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.acoustic_dim = acoustic_dim
+        self.xvec_dim = xvec_dim
+
         # Self-attention before LSTM
-        if ENABLE_SELF_ATTENTION:
-            # choose heads based on divisibility
-            num_heads_self = 4 if input_dim % 4 == 0 else 1
-            self.self_attn = nn.MultiheadAttention(
-                embed_dim=input_dim,
-                num_heads=num_heads_self,
-                batch_first=True
+        if ENABLE_SELF_ATTENTION and acoustic_dim > 0:
+            heads = 4
+            while acoustic_dim % heads != 0 and heads > 1:
+                heads -= 1
+            self.self_attn = nn.MultiheadAttention(acoustic_dim, num_heads=heads, batch_first=True)
+
+        # BiLSTM
+        if acoustic_dim > 0:
+            self.lstm = nn.LSTM(
+                acoustic_dim, hidden_dim,
+                batch_first=True, bidirectional=True
             )
-        else:
-            self.self_attn = None
-        # Bidirectional LSTM
-        self.lstm = nn.LSTM(
-            input_dim,
-            hidden_dim,
-            batch_first=True,
-            bidirectional=True
-        )
-        # Temporal attention: multi-head or single-head
-        if ENABLE_MULTIHEAD_ATTENTION:
-            temp_dim = hidden_dim * 2
-            num_heads_temp = 4 if temp_dim % 4 == 0 else 1
-            self.temporal_attn = nn.MultiheadAttention(
-                embed_dim=temp_dim,
-                num_heads=num_heads_temp,
-                batch_first=True
-            )
-            self.attn_fc = None
-        elif ENABLE_TEMPORAL_ATTENTION:
-            self.temporal_attn = None
+
+        # Multi-head or temporal attention after LSTM
+        if ENABLE_MULTIHEAD_ATTENTION and acoustic_dim > 0:
+            heads = 4
+            total_dim = hidden_dim * 2
+            while total_dim % heads != 0 and heads > 1:
+                heads -= 1
+            self.post_attn = nn.MultiheadAttention(total_dim, num_heads=heads, batch_first=True)
+        elif ENABLE_TEMPORAL_ATTENTION and acoustic_dim > 0:
             self.attn_fc = nn.Linear(hidden_dim * 2, 1)
-        else:
-            self.temporal_attn = None
-            self.attn_fc = None
+
         # Final classifier
-        total_dim = hidden_dim * 2 + (xvec_dim if ENABLE_XVECTOR else 0)
-        self.fc = nn.Linear(total_dim, num_classes)
+        fc_in = (hidden_dim*2 if acoustic_dim > 0 else 0) + (xvec_dim if ENABLE_XVECTOR else 0)
+        self.fc = nn.Linear(fc_in, num_classes)
 
-    def forward(self, x, xvec=None):
-        # x: [B, T, D]
-        # Apply self-attention if configured
-        if self.self_attn is not None:
-            x, _ = self.self_attn(x, x, x)  # [B, T, D]
-        # Pass through BiLSTM
-        h, _ = self.lstm(x)  # [B, T, 2H]
-        # Apply temporal attention
-        if self.temporal_attn is not None:
-            h_att, _ = self.temporal_attn(h, h, h)  # [B, T, 2H]
-            context = h_att.mean(dim=1)            # [B, 2H]
-        elif self.attn_fc is not None:
-            scores = torch.tanh(self.attn_fc(h))   # [B, T, 1]
-            weights = F.softmax(scores, dim=1)     # [B, T, 1]
-            context = (weights * h).sum(dim=1)     # [B, 2H]
+    def forward(self, acoustic, xvec):
+        # Bypass acoustic branch if disabled
+        if acoustic.numel() == 0:
+            ctx = xvec
         else:
-            # No attention: average pooling
-            context = h.mean(dim=1)               # [B, 2H]
-        # Concatenate x-vector if used
-        if ENABLE_XVECTOR and xvec is not None and xvec.numel() > 0:
-            if xvec.dim() == 1:
-                xvec = xvec.unsqueeze(0).expand(context.size(0), -1)
-            context = torch.cat([context, xvec], dim=1)
+            x = acoustic  # [B, T, D]
+
+            # Self-attention
+            if ENABLE_SELF_ATTENTION:
+                x, _ = self.self_attn(x, x, x)  # [B, T, D]
+
+            # BiLSTM
+            hseq, _ = self.lstm(x)  # [B, T, 2H]
+
+            # Post-LSTM attention
+            if ENABLE_MULTIHEAD_ATTENTION:
+                hseq, _ = self.post_attn(hseq, hseq, hseq)
+                ctx = hseq.mean(dim=1)
+            else:
+                e = torch.tanh(self.attn_fc(hseq))      # [B, T, 1]
+                w = torch.softmax(e, dim=1)             # [B, T, 1]
+                ctx = (w * hseq).sum(dim=1)             # [B, 2H]
+
+            # Concat x-vector
+            if ENABLE_XVECTOR:
+                ctx = torch.cat([ctx, xvec], dim=1)
+
         # Final classification
-        return self.fc(context)
+        logits = self.fc(ctx)
+        return logits
 
-# Training and evaluation routines (unchanged signatures)
-def train_epoch(model, loader, optim, crit, dev):
-    model.train(); total=0
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
     for acoustic, xvec, labels in loader:
-        acoustic, labels = acoustic.to(dev), labels.to(dev)
-        if ENABLE_XVECTOR:
-            xvec = xvec.to(dev)
-            outputs = model(acoustic, xvec)
-        else:
-            outputs = model(acoustic)
-        loss = crit(outputs, labels)
-        optim.zero_grad(); loss.backward(); optim.step()
-        total += loss.item()
-    return total/len(loader)
+        acoustic, xvec, labels = acoustic.to(device), xvec.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(acoustic, xvec)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
 
-def eval_epoch(model, loader, crit, dev):
-    model.eval(); total=0; corr=0; count=0
+
+def eval_epoch(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    all_preds, all_true = [], []
     with torch.no_grad():
         for acoustic, xvec, labels in loader:
-            acoustic, labels = acoustic.to(dev), labels.to(dev)
-            if ENABLE_XVECTOR:
-                xvec = xvec.to(dev)
-                outputs = model(acoustic, xvec)
-            else:
-                outputs = model(acoustic)
-            loss = crit(outputs, labels)
-            total += loss.item()
+            acoustic, xvec, labels = acoustic.to(device), xvec.to(device), labels.to(device)
+            outputs = model(acoustic, xvec)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
             preds = outputs.argmax(dim=1)
-            true = labels.argmax(dim=1)
-            corr += (preds == true).sum().item()
-            count += labels.size(0)
-    return total/len(loader), corr/count
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            all_preds.extend(preds.cpu().tolist())
+            all_true.extend(labels.cpu().tolist())
+    return total_loss / len(loader), correct / total, all_true, all_preds
 
-# Main pipeline with optional class balancing and cross-validation
 
 def main():
-    # Set device for training
+    metadata_csv = "F:/DOCTORADO/DATASETS/IEMOCAP/archive/iemocap_full_dataset.csv"
+    audio_dir = "F:/DOCTORADO/DATASETS/IEMOCAP/archive/IEMOCAP_full_release"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Fixed data label list and display names
-    data_labels = ['neu', 'fru', 'xxx', 'sur', 'ang', 'hap', 'sad', 'exc', 'fea']
-    display_labels = ['neu', 'fru', 'other', 'sur', 'ang', 'hap', 'sad', 'exc', 'fea']
-    label2idx = {label: idx for idx, label in enumerate(data_labels)}
 
-    # Load and filter metadata
-    df = pd.read_csv(
-        "F:/DOCTORADO/DATASETS/IEMOCAP/archive/iemocap_full_dataset.csv"
-    )
-    df = df[df['emotion'].isin(data_labels)].reset_index(drop=True)
-    # Print total number of audio files after filtering
-    print(f"Total audio files detected: {len(df)}")
+    df = pd.read_csv(metadata_csv)
+    df = df[df['emotion'].isin(LABEL_LIST)].reset_index(drop=True)
+    print(f"Total audio files after filtering to {LABEL_LIST}: {len(df)}")
 
-    # Function to train and evaluate one train/val split
-    def run_fold(train_df, val_df):
-        # Prepare datasets
-        train_ds = SERDataset(
-            train_df,
-            "F:/DOCTORADO/DATASETS/IEMOCAP/archive/IEMOCAP_full_release",
-            label2idx
-        )
-        val_ds = SERDataset(
-            val_df,
-            "F:/DOCTORADO/DATASETS/IEMOCAP/archive/IEMOCAP_full_release",
-            label2idx
-        )
-        # DataLoader with optional class balancing
-        if ENABLE_CLASS_BALANCING:
-            counts = train_df['emotion'].value_counts().to_dict()
-            weights = [1.0/counts[e] for e in train_df['emotion']]
-            sampler = WeightedRandomSampler(weights, len(weights))
-            train_loader = DataLoader(train_ds, batch_size=16, sampler=sampler)
+    train_df, val_df = train_test_split(df, test_size=0.25,
+                                        stratify=df['emotion'], random_state=42)
+
+    sampler = None
+    if ENABLE_CLASS_BALANCING:
+        counts = train_df['emotion'].value_counts().to_dict()
+        weights = [1.0 / counts[e] for e in train_df['emotion']]
+        sampler = WeightedRandomSampler(weights, len(weights))
+
+    train_ds, val_ds = SERDataset(train_df, audio_dir), SERDataset(val_df, audio_dir)
+    train_loader = DataLoader(train_ds, batch_size=16,
+                              shuffle=(sampler is None), sampler=sampler)
+    val_loader = DataLoader(val_ds, batch_size=16)
+
+        # ======================
+    # Compute acoustic input dimension dynamically
+    # ======================
+    acoustic_dim = 0
+    if ENABLE_SPECTRAL:
+        acoustic_dim += N_MFCC
+    if ENABLE_MELSPECTROGRAM:
+        acoustic_dim += N_MELS
+    if ENABLE_PROSODY:
+        acoustic_dim += PROSODIC_FEAT_DIM
+
+    xvec_dim = train_ds[0][1].shape[0] if ENABLE_XVECTOR else 0
+
+    model = LSTMAttentionWithXVector(
+        acoustic_dim=acoustic_dim,
+        xvec_dim=xvec_dim,
+        hidden_dim=128,
+        num_classes=len(LABEL_LIST)
+    ).to(device)
+
+
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    best_acc, patience, no_improve = 0.0, 5, 0
+    train_losses, val_losses = [], []
+    for epoch in range(1, 31):
+        tr_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_acc, y_true, y_pred = eval_epoch(model, val_loader, criterion, device)
+        train_losses.append(tr_loss)
+        val_losses.append(val_loss)
+
+        if val_acc > best_acc:
+            best_acc, no_improve = val_acc, 0
+            torch.save(model.state_dict(), "best_model.pt")
         else:
-            train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=16)
+            no_improve += 1
 
-        # Model, optimizer, scheduler, loss
-        input_dim = train_ds[0][0].shape[1]
-        xvec_dim = train_ds[0][1].shape[0] if ENABLE_XVECTOR else 0
-        model = LSTMAttentionSER(
-            input_dim, xvec_dim, hidden_dim=128,
-            num_classes=len(data_labels)
-        ).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=1e-3)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3
-        )
-        criterion = nn.BCEWithLogitsLoss()
+        print(f"Epoch {epoch}: tr_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")
+        if no_improve >= patience:
+            print("Early stopping.")
+            break
 
-        train_losses, val_losses = [], []
-        best_acc, patience = 0.0, 0
-        for epoch in range(1, 31):
-            tr_loss = train_epoch(
-                model, train_loader, optimizer, criterion, device
-            )
-            vl_loss, vl_acc = eval_epoch(
-                model, val_loader, criterion, device
-            )
-            train_losses.append(tr_loss)
-            val_losses.append(vl_loss)
-            scheduler.step(vl_loss)
-            if vl_acc > best_acc:
-                best_acc, patience = vl_acc, 0
-            else:
-                patience += 1
-            if patience >= 5:
-                break
-        return best_acc, train_losses, val_losses, model, val_loader
+    # Plot loss curves
+    plt.figure()
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_losses, label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("loss_curve.png")
+    plt.show()
 
-    # Cross-validation or single split
-    if ENABLE_CROSS_VALIDATION:
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        accs = []
-        for train_idx, val_idx in kf.split(df):
-            tdf, vdf = df.iloc[train_idx], df.iloc[val_idx]
-            acc, *_ = run_fold(tdf, vdf)
-            accs.append(acc)
-        print("CV accuracies:", accs)
-        print("Mean acc:", np.mean(accs))
-    else:
-        # Single train/val split
-        train_df, val_df = train_test_split(
-            df,
-            test_size=0.25,
-            stratify=df['emotion'],
-            random_state=42
-        )
-        best_acc, tr_l, val_l, model, val_loader = run_fold(train_df, val_df)
-        print(f"Validation accuracy: {best_acc:.4f}")
+    # Classification report
+    print(classification_report(
+        y_true, y_pred,
+        labels=list(range(len(LABEL_LIST))),
+        target_names=LABEL_LIST
+    ))
 
-        # Plot loss curves
-        plt.figure()
-        plt.plot(tr_l, label='Train Loss')
-        plt.plot(val_l, label='Val Loss')
-        plt.legend()
-        plt.show()
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(LABEL_LIST))))
+    plt.figure(figsize=(8, 6))
+    im = plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title("Confusion Matrix")
+    plt.colorbar(im)
+    ticks = np.arange(len(LABEL_LIST))
+    plt.xticks(ticks, LABEL_LIST, rotation=45)
+    plt.yticks(ticks, LABEL_LIST)
+    thresh = cm.max() / 2
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, cm[i, j],
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > thresh else "black")
+    plt.tight_layout()
+    plt.savefig("confusion_matrix.png")
+    plt.show()
 
-        # Classification report and confusion matrix
-        from sklearn.metrics import classification_report, confusion_matrix
-        y_true, y_pred = [], []
-        for acoustic, xvec, labels in val_loader:
-            acoustic = acoustic.to(device)
-            outputs = (
-                model(acoustic, xvec.to(device))
-                if ENABLE_XVECTOR else model(acoustic)
-            )
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            trg = labels.argmax(dim=1).cpu().numpy()
-            y_pred.extend(preds)
-            y_true.extend(trg)
-        print(classification_report(
-            y_true,
-            y_pred,
-            labels=list(range(len(display_labels))),
-            target_names=display_labels
-        ))
-        cm = confusion_matrix(y_true, y_pred)
-        plt.figure(figsize=(8,6))
-        plt.imshow(cm, cmap='Blues')
-        plt.colorbar()
-        ticks = np.arange(len(display_labels))
-        plt.xticks(ticks, display_labels, rotation=45)
-        plt.yticks(ticks, display_labels)
-        plt.show()
+    print(f"Best validation accuracy: {best_acc:.4f}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
