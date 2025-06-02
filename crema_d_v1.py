@@ -26,12 +26,12 @@ from speechbrain.pretrained import EncoderClassifier
 # ======================
 ENABLE_SPECTRAL            = True
 ENABLE_SPECTRAL_ATTENTION  = False
-ENABLE_MELSPECTROGRAM      = False
+ENABLE_MELSPECTROGRAM      = True
 ENABLE_PROSODY             = True
 ENABLE_PROSODY_ATTENTION   = False
 ENABLE_XVECTOR             = False
-ENABLE_SELF_ATTENTION      = True
-ENABLE_MULTIHEAD_ATTENTION = False
+ENABLE_SELF_ATTENTION      = False
+ENABLE_MULTIHEAD_ATTENTION = True
 ENABLE_TEMPORAL_ATTENTION  = True
 ENABLE_CLASS_BALANCING     = False
 ENABLE_CROSS_VALIDATION    = False  # not implemented in this script
